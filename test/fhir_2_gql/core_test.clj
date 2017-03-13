@@ -24,4 +24,4 @@
     (is (= :many (cardinality {:min 1 :max 2}))))
   (testing "structure-def->gql-type"
     (doseq [res (resources (io/resource "examples/"))]
-      (is (valid-gql? (structure-def->gql-type (slurp (first (val res)))))))))
+      (is (valid-gql? (structure-def->schema-str (slurp (first (val res))))) (key res)))))

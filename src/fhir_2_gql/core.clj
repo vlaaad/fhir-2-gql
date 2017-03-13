@@ -1,7 +1,10 @@
 (ns fhir-2-gql.core
   (:require [clojure.data.json :refer [read-str]]
             [clojure.core.match :refer [match]]
+            [fhir-2-gql.util :refer :all]
             [clojure.string :as str]))
+
+;; processing
 
 (defn cardinality [element]
   (match [(:min element) (:max element)]
@@ -10,60 +13,77 @@
     [0 "0"] :none
     :else :many))
 
-(defn- upper-case? [str]
-  (Character/isUpperCase (first str)))
+(defn- fhir->gql-type-name [type-name]
+  (condp #(%1 %2) type-name
+    nil?               nil
+    #{"dateTime"
+      "instant"}       "Instant" ;; TODO define Instant scalar type in overall gql schema
+    #{"time"}          "Time"    ;; TODO define Time scalar type in overall gql schema
+    #{"date"}          "Date"    ;; TODO define Date scalar type in overall gql schema
+    #{"boolean"}       "Boolean"
+    #{"id"}            "ID"
+    #{"decimal"}       "Float"
+    #{"integer"
+      "positiveInt"
+      "unsignedInt"}   "Int"
+    #{"string"
+      "code"
+      "base64Binary"
+      "markdown"
+      "xhtml"
+      "uri"
+      "oid"}           "String"
+    first-capitalized? type-name))
 
-(derive ::dateTime ::instant)
+(defn- add-type-declaration [acc type-name]
+  (assoc acc type-name []))
 
-(derive ::base64Binary ::string)
-(derive ::code ::string)
-(derive ::markdown ::string)
-(derive ::uri ::string)
-(derive ::oid ::string)
+(defn- add-field-info [acc type-name field-info]
+  (update acc type-name conj field-info))
 
-(derive ::unsignedInt ::integer)
-(derive ::positiveInt ::integer)
-
-(defmulti type-name (comp #(keyword "fhir-2-gql.core" %) :code first))
-(defmethod type-name ::instant [_] "Instant") ;; TODO define Instant scalar type in overall gql schema
-(defmethod type-name ::time [_] "Time") ;; TODO define Time scalar type in overall gql schema
-(defmethod type-name ::date [_] "Date") ;; TODO define Date scalar type in overall gql schema
-(defmethod type-name ::boolean [_] "Boolean")
-(defmethod type-name ::id [_] "ID")
-(defmethod type-name ::decimal [_] "Float")
-(defmethod type-name ::string [_] "String")
-(defmethod type-name ::integer [_] "Int")
-(defmethod type-name :default [v]
-  (let [base-type (:code (first v))]
-    (if (Character/isUpperCase (first base-type))
-      base-type
-      {:todo v})))
-
-#_(defn- type-name [element]
-    (let [type-data (:type element)
-          type-name (:code (first type-data))]
-      (condp #(%1 %2) type-name
-        upper-case?             type-name)))
-
-(defn- element->gql-field-data-fn [struct-type]
-  (fn [x]
-    (let [cardinality (cardinality x)]
-      (when (and (not (:sliceName x))
+(defn- process-element [acc element]
+  (let [path (str/split (:path element) #"\.")]
+    (if (= 1 (count path))
+      (add-type-declaration acc (capitalize-first (first path)))
+      (let [entity-type (str/join (map capitalize-first (butlast path)))
+            field       (str/replace (last path) #"\[x\]$" "")
+            cardinality (cardinality element)
+            field-type  (fhir->gql-type-name (:code (first (:type element))))]
+        (if (and (not (:sliceName element))
+                 field-type
                  (not= :none cardinality))
-        {:cardinality cardinality
-         :type        (type-name (:type x))
-         :field       (str/replace (:path x) (re-pattern (str "^" struct-type "\\.")) "")}))))
+          (add-field-info acc entity-type {:field       field
+                                           :cardinality cardinality
+                                           :type        field-type})
+          acc)))))
 
-(defn- render-type [type-name fields]
-  (str "type " type-name " {\n  "
-       (str/join "\n  " (map (fn [{:keys [field cardinality type]}]
-                               (str field ": " (case cardinality
-                                                 :one      (str type "!")
-                                                 :optional type
-                                                 :many     (str "[" type "!]!")))) fields))
-       "\n}"))
+;; rendering
 
-(defn structure-def->gql-type [json-str]
-  (let [[head & tail] (:element (:snapshot (read-str json-str :key-fn keyword)))
-        struct-type   (:path head)]
-    (render-type struct-type (keep (element->gql-field-data-fn struct-type) tail))))
+(defn- cardinality->gql
+  [cardinality type]
+  (case cardinality
+    :one      (str type "!")
+    :optional type
+    :many     (str "[" type "!]!")))
+
+;; api
+
+(defn gql-type-map->schema-str [coll]
+  (str/join
+   "\n"
+   (map
+    (fn [[type-name fields]]
+      (str "type " type-name " {\n  "
+           (str/join "\n  "
+                     (map
+                      (fn [{:keys [field cardinality type]}]
+                        (str field ": " (cardinality->gql cardinality type)))
+                      fields))
+           "\n}"))
+    coll)))
+
+(defn structure-def->gql-type-map [json-str]
+  (reduce process-element {} (:element (:snapshot (read-str json-str :key-fn keyword)))))
+
+(defn structure-def->schema-str [json-str]
+  (gql-type-map->schema-str (structure-def->gql-type-map json-str)))
