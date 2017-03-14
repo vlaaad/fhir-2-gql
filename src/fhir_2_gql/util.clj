@@ -9,3 +9,6 @@
 
 (defn first-capitalized? [^CharSequence s]
   (Character/isUpperCase (first s)))
+
+(defn call [f & args]
+  (apply f args))

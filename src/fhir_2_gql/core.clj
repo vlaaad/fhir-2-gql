@@ -1,8 +1,10 @@
 (ns fhir-2-gql.core
-  (:require [clojure.data.json :refer [read-str]]
-            [clojure.core.match :refer [match]]
-            [fhir-2-gql.util :refer :all]
-            [clojure.string :as str]))
+  (:require [clojure.core.match :refer [match]]
+            [clojure.data.json :refer [read-str]]
+            [clojure.string :as str]
+            [fhir-2-gql
+             [render :refer [gql-type-map->schema-str]]
+             [util :refer :all]]))
 
 (def graphql-scalar-types #{"Int" "Float" "String" "Boolean" "ID"})
 
@@ -20,7 +22,7 @@
 
 (defn- fhir->gql-type-name [type-info]
   (let [name (:code type-info)]
-    (condp #(%1 %2) name
+    (condp call name
       #{"boolean"}       "Boolean"
       #{"id"}            "ID"
       #{"decimal"}       "Float"
@@ -54,7 +56,7 @@
   (assoc acc type-name {:kind :union
                         :types types}))
 
-(defn- add-field-info [acc type-name field-info]
+(defn- add-field [acc type-name field-info]
   (when-not (get acc type-name)
     (throw (ex-info "can't add field to non-existent type" {:type  type-name
                                                             :field field-info})))
@@ -67,7 +69,7 @@
 (defn- embedded-type? [type-names]
   (#{["BackboneElement"] ["Element"]} type-names))
 
-(defn union-type? [type-names path]
+(defn union-type? [type-names]
   ;; NOTE: covers 2 cases: references to multiple and "[x]"-values
   (> (count type-names) 1))
 
@@ -75,84 +77,58 @@
   (= (count type-names) 1))
 
 (defn- process-type-names [type-names acc path]
-  (condp #(%1 %2) type-names
+  (condp call type-names
     embedded-type?        (let [type-name (path->type-name path)]
                             [(add-type-declaration acc type-name false nil) type-name])
-    #(union-type? % path) (let [type-name (path->type-name path)]
+    union-type? (let [type-name (path->type-name path)]
                             [(add-union-type acc type-name type-names) type-name])
     simple-type?          [acc (first type-names)]))
 
 (defn- path [element]
-  (str/split (str/replace (:path element) #"\[x\]$" "") #"\."))
+  (-> (:path element)
+      (str/replace #"\[x\]$" "")
+      (str/split #"\.")))
 
 (defn- scalar? [element]
   (and (:_code (first (:type element)))
        (= "value" (last (path element)))))
 
 (defn- field? [element]
-  (and (not (:sliceName element)) (:type element)))
+  (:type element))
 
 (defn- type-decl? [element]
   (= 1 (count (path element))))
 
+(defn- slice? [element]
+  (:sliceName element))
+
 (defn- process-element-rf [structure-def]
   (fn [acc element]
     (let [path (path element)]
-      (cond
-        (type-decl? element) (add-type-declaration acc
-                                                   (capitalize-first (first path))
-                                                   (:abstract structure-def)
-                                                   (some-> (or (:base structure-def)
-                                                               (:baseDefinition structure-def))
-                                                           url->type-name))
-        (scalar? element)    (let [scalar-type-name (path->type-name (butlast path))]
-                               (reduced (if (graphql-scalar-types scalar-type-name)
-                                          {}
-                                          {scalar-type-name {:kind :scalar}})))
-        (field? element)     (let [[acc type-name] (process-type-names
-                                                    (mapv fhir->gql-type-name (:type element))
-                                                    acc
-                                                    path)]
-                               (add-field-info acc
-                                               (path->type-name (butlast path))
-                                               {:field       (last path)
-                                                :cardinality (cardinality element)
-                                                :type        type-name}))
-        :else                acc))))
-
-;; rendering
-
-(defn- render-cardinality
-  [cardinality type]
-  (case cardinality
-    :one      (str type "!")
-    :optional type
-    :many     (str "[" type "!]!")))
-
-(defn- render-type [type-name {:keys [abstract fields base]}]
-  (str (if abstract "interface" "type") " " type-name " "
-       ;; NOTE: graphql interfaces can't implement other interfaces
-       (when (and (not abstract) base) (str "implements " base " ")) "{\n  "
-       (str/join "\n  "
-                 (->> fields
-                      (remove (comp #{:none} :cardinality))
-                      (map
-                       (fn [{:keys [field cardinality type]}]
-                         (str field ": " (render-cardinality cardinality type))))))
-       "\n}"))
+      (condp call element
+        type-decl? (add-type-declaration acc
+                                         (capitalize-first (first path))
+                                         (:abstract structure-def)
+                                         (some-> (or (:base structure-def)
+                                                     (:baseDefinition structure-def))
+                                                 url->type-name))
+        slice?     acc
+        scalar?    (let [scalar-type-name (path->type-name (butlast path))]
+                     (reduced (if (graphql-scalar-types scalar-type-name)
+                                {}
+                                {scalar-type-name {:kind :scalar}})))
+        field?     (let [[acc type-name] (process-type-names
+                                          (mapv fhir->gql-type-name (:type element))
+                                          acc
+                                          path)]
+                     (add-field acc
+                                     (path->type-name (butlast path))
+                                     {:field       (last path)
+                                      :cardinality (cardinality element)
+                                      :type        type-name}))
+        acc))))
 
 ;; api
-
-(defn gql-type-map->schema-str [coll]
-  (str/join
-   "\n"
-   (map
-    (fn [[type-name {:keys [kind] :as data}]]
-      (case kind
-        :type (render-type type-name data)
-        :scalar (str "scalar " type-name)
-        :union (str "union " type-name " = " (str/join " | " (:types data)))))
-    coll)))
 
 (defn structure-def->gql-type-map [json-str]
   (let [structure-def (read-str json-str :key-fn keyword)]
