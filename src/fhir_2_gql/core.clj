@@ -4,6 +4,8 @@
             [fhir-2-gql.util :refer :all]
             [clojure.string :as str]))
 
+(def graphql-scalar-types #{"Int" "Float" "String" "Boolean" "ID"})
+
 ;; processing
 
 (defn cardinality [element]
@@ -32,16 +34,12 @@
         "base64Binary"}  (capitalize-first name)
       #{"code"
         "markdown"
-        "xhtml"}           "String"
+        "xhtml"}         "String"
       #{"Reference"}     (str/replace (first (:profile type-info)) #"^.+/" "")
       first-capitalized? name)))
 
 (defn- add-type-declaration [acc type-name]
   (assoc acc type-name {:kind :type :fields []}))
-
-;; TODO union types: detect when there are many field types and extract
-;; TODO enums from codes
-;; TODO abstract types
 
 (defn- add-field-info [acc type-name field-info]
   (update-in acc [type-name :fields] (fn [coll]
@@ -58,8 +56,7 @@
       [(add-type-declaration acc type-name) type-name])
     [acc type-name]))
 
-(defn- path
-  [element]
+(defn- path [element]
   (str/split (:path element) #"\."))
 
 (defn- scalar? [element]
@@ -74,7 +71,10 @@
     (if (= 1 (count path))
       (add-type-declaration acc (capitalize-first (first path)))
       (cond
-        (scalar? element) (reduced {(path->type-name (butlast path)) {:kind :scalar}})
+        (scalar? element) (let [scalar-type-name (path->type-name (butlast path))]
+                            (reduced (if (graphql-scalar-types scalar-type-name)
+                               {}
+                               {scalar-type-name {:kind :scalar}})))
         (field? element)  (let [type-name       (fhir->gql-type-name (first (:type element)))
                                 [acc type-name] (override-type-name type-name acc path)]
                             (add-field-info acc
