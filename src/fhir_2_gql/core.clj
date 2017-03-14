@@ -38,7 +38,10 @@
       #{"code"
         "markdown"
         "xhtml"}         "String"
-      #{"Reference"}     (url->type-name (first (:profile type-info)))
+      #{"Reference"}     (if-let [referenced-url (first (or (:profile type-info)
+                                                            (:targetProfile type-info)))]
+                           (url->type-name referenced-url)
+                           "Reference")
       first-capitalized? name)))
 
 (defn- add-type-declaration [acc type-name abstract base]
@@ -46,6 +49,10 @@
                         :abstract abstract
                         :base     base
                         :fields   []}))
+
+(defn- add-union-type [acc type-name types]
+  (assoc acc type-name {:kind :union
+                        :types types}))
 
 (defn- add-field-info [acc type-name field-info]
   (update-in acc [type-name :fields] (fn [coll]
@@ -56,14 +63,26 @@
   [path]
   (str/join (map capitalize-first path)))
 
-(defn- override-type-name [type-name acc path]
-  (if (#{"BackboneElement" "Element"} type-name)
-    (let [type-name (path->type-name path)]
-      [(add-type-declaration acc type-name false nil) type-name])
-    [acc type-name]))
+(defn- embedded-type? [type-names]
+  (#{["BackboneElement"] ["Element"]} type-names))
+
+(defn union-type? [type-names path]
+  ;; NOTE: covers 2 cases: references to multiple and "[x]"-values
+  (> (count type-names) 1))
+
+(defn simple-type? [type-names]
+  (= (count type-names) 1))
+
+(defn- process-type-names [type-names acc path]
+  (condp #(%1 %2) type-names
+    embedded-type?        (let [type-name (path->type-name path)]
+                            [(add-type-declaration acc type-name false nil) type-name])
+    #(union-type? % path) (let [type-name (path->type-name path)]
+                            [(add-union-type acc type-name type-names) type-name])
+    simple-type?          [acc (first type-names)]))
 
 (defn- path [element]
-  (str/split (:path element) #"\."))
+  (str/split (str/replace (:path element) #"\[x\]$" "") #"\."))
 
 (defn- scalar? [element]
   (and (:_code (first (:type element)))
@@ -89,11 +108,13 @@
                                (reduced (if (graphql-scalar-types scalar-type-name)
                                           {}
                                           {scalar-type-name {:kind :scalar}})))
-        (field? element)     (let [type-name       (fhir->gql-type-name (first (:type element)))
-                                   [acc type-name] (override-type-name type-name acc path)]
+        (field? element)     (let [[acc type-name] (process-type-names
+                                                    (mapv fhir->gql-type-name (:type element))
+                                                    acc
+                                                    path)]
                                (add-field-info acc
                                                (path->type-name (butlast path))
-                                               {:field       (str/replace (last path) #"\[x\]$" "")
+                                               {:field       (last path)
                                                 :cardinality (cardinality element)
                                                 :type        type-name}))
         :else                acc))))
@@ -128,7 +149,8 @@
     (fn [[type-name {:keys [kind] :as data}]]
       (case kind
         :type (render-type type-name data)
-        :scalar (str "scalar " type-name)))
+        :scalar (str "scalar " type-name)
+        :union (str "union " type-name " = " (str/join " | " (:types data)))))
     coll)))
 
 (defn structure-def->gql-type-map [json-str]
