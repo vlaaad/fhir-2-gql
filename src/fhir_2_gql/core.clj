@@ -15,6 +15,9 @@
     [0 "0"] :none
     :else :many))
 
+(defn- url->type-name [url]
+  (str/replace url #"^.+/" ""))
+
 (defn- fhir->gql-type-name [type-info]
   (let [name (:code type-info)]
     (condp #(%1 %2) name
@@ -35,11 +38,14 @@
       #{"code"
         "markdown"
         "xhtml"}         "String"
-      #{"Reference"}     (str/replace (first (:profile type-info)) #"^.+/" "")
+      #{"Reference"}     (url->type-name (first (:profile type-info)))
       first-capitalized? name)))
 
-(defn- add-type-declaration [acc type-name]
-  (assoc acc type-name {:kind :type :fields []}))
+(defn- add-type-declaration [acc type-name abstract base]
+  (assoc acc type-name {:kind     :type
+                        :abstract abstract
+                        :base     base
+                        :fields   []}))
 
 (defn- add-field-info [acc type-name field-info]
   (update-in acc [type-name :fields] (fn [coll]
@@ -53,7 +59,7 @@
 (defn- override-type-name [type-name acc path]
   (if (#{"BackboneElement" "Element"} type-name)
     (let [type-name (path->type-name path)]
-      [(add-type-declaration acc type-name) type-name])
+      [(add-type-declaration acc type-name false nil) type-name])
     [acc type-name]))
 
 (defn- path [element]
@@ -66,32 +72,52 @@
 (defn- field? [element]
   (and (not (:sliceName element)) (:type element)))
 
-(defn- process-element [acc element]
-  (let [path (path element)]
-    (if (= 1 (count path))
-      (add-type-declaration acc (capitalize-first (first path)))
+(defn- type-decl? [element]
+  (= 1 (count (path element))))
+
+(defn- process-element-rf [structure-def]
+  (fn [acc element]
+    (let [path (path element)]
       (cond
-        (scalar? element) (let [scalar-type-name (path->type-name (butlast path))]
-                            (reduced (if (graphql-scalar-types scalar-type-name)
-                               {}
-                               {scalar-type-name {:kind :scalar}})))
-        (field? element)  (let [type-name       (fhir->gql-type-name (first (:type element)))
-                                [acc type-name] (override-type-name type-name acc path)]
-                            (add-field-info acc
-                                            (path->type-name (butlast path))
-                                            {:field       (str/replace (last path) #"\[x\]$" "")
-                                             :cardinality (cardinality element)
-                                             :type        type-name}))
-        :else             acc))))
+        (type-decl? element) (add-type-declaration acc
+                                                   (capitalize-first (first path))
+                                                   (:abstract structure-def)
+                                                   (some-> (or (:base structure-def)
+                                                               (:baseDefinition structure-def))
+                                                           url->type-name))
+        (scalar? element)    (let [scalar-type-name (path->type-name (butlast path))]
+                               (reduced (if (graphql-scalar-types scalar-type-name)
+                                          {}
+                                          {scalar-type-name {:kind :scalar}})))
+        (field? element)     (let [type-name       (fhir->gql-type-name (first (:type element)))
+                                   [acc type-name] (override-type-name type-name acc path)]
+                               (add-field-info acc
+                                               (path->type-name (butlast path))
+                                               {:field       (str/replace (last path) #"\[x\]$" "")
+                                                :cardinality (cardinality element)
+                                                :type        type-name}))
+        :else                acc))))
 
 ;; rendering
 
-(defn- cardinality->gql
+(defn- render-cardinality
   [cardinality type]
   (case cardinality
     :one      (str type "!")
     :optional type
     :many     (str "[" type "!]!")))
+
+(defn- render-type [type-name {:keys [abstract fields base]}]
+  (str (if abstract "interface" "type") " " type-name " "
+       ;; NOTE: graphql interfaces can't implement other interfaces
+       (when (and (not abstract) base) (str "implements " base " ")) "{\n  "
+       (str/join "\n  "
+                 (->> fields
+                      (remove (comp #{:none} :cardinality))
+                      (map
+                       (fn [{:keys [field cardinality type]}]
+                         (str field ": " (render-cardinality cardinality type))))))
+       "\n}"))
 
 ;; api
 
@@ -101,19 +127,13 @@
    (map
     (fn [[type-name {:keys [kind] :as data}]]
       (case kind
-        :type (str "type " type-name " {\n  "
-                   (str/join "\n  "
-                             (->> (:fields data)
-                                  (remove (comp #{:none} :cardinality))
-                                  (map
-                                   (fn [{:keys [field cardinality type]}]
-                                     (str field ": " (cardinality->gql cardinality type))))))
-                   "\n}")
+        :type (render-type type-name data)
         :scalar (str "scalar " type-name)))
     coll)))
 
 (defn structure-def->gql-type-map [json-str]
-  (reduce process-element {} (:element (:snapshot (read-str json-str :key-fn keyword)))))
+  (let [structure-def (read-str json-str :key-fn keyword)]
+    (reduce (process-element-rf structure-def) {} (:element (:snapshot structure-def)))))
 
 (defn structure-def->schema-str [json-str]
   (gql-type-map->schema-str (structure-def->gql-type-map json-str)))

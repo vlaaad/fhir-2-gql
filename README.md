@@ -15,9 +15,8 @@ Library to convert fhir structure definitions to graphql schema definitions
 
 # TODO
 
-- union types for some references
+- union types for some references/codeable concepts
 - enums from some codes
-- abstract fhir types to graphql interfaces
 
 # Tests
 
