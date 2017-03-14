@@ -55,9 +55,10 @@
                         :types types}))
 
 (defn- add-field-info [acc type-name field-info]
-  (update-in acc [type-name :fields] (fn [coll]
-                                       {:pre [(not (nil? coll))]}
-                                       (conj coll field-info))))
+  (when-not (get acc type-name)
+    (throw (ex-info "can't add field to non-existent type" {:type  type-name
+                                                            :field field-info})))
+  (update-in acc [type-name :fields] conj field-info))
 
 (defn- path->type-name
   [path]
