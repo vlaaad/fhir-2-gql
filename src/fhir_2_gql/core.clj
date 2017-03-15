@@ -1,50 +1,14 @@
 (ns fhir-2-gql.core
-  (:require [clojure.core.match :refer [match]]
-            [clojure.data.json :refer [read-str]]
+  (:require [clojure.data.json :refer [read-str]]
             [clojure.string :as str]
             [fhir-2-gql
+             [element :as el]
              [render :refer [gql-type-map->schema-str]]
              [util :refer :all]]))
 
 (def graphql-scalar-types #{"Int" "Float" "String" "Boolean" "ID"})
 
-;; processing
-
-(defn cardinality [element]
-  (match [(:min element) (:max element)]
-    [0 "1"] :optional
-    [1 "1"] :one
-    [0 "0"] :none
-    :else :many))
-
-(defn- url->type-name [url]
-  (str/replace url #"^.+/" ""))
-
-(defn- fhir->gql-type-name [type-info]
-  (let [name (:code type-info)]
-    (condp call name
-      #{"id"}            "ID"
-      #{"integer"
-        "positiveInt"
-        "unsignedInt"}   "Int"
-      #{"time"
-        "oid"
-        "boolean"
-        "decimal" ;; NOTE decimal is mapped to custom scalar type instead of Float because FHIR spec recommends using bigints instead of floats
-        "date"
-        "dateTime"
-        "instant"
-        "string"
-        "uri"
-        "markdown"
-        "code"
-        "base64Binary"}  (capitalize-first name)
-      #{"xhtml"}         "String"
-      #{"Reference"}     (if-let [referenced-url (first (or (:profile type-info)
-                                                            (:targetProfile type-info)))]
-                           (url->type-name referenced-url)
-                           "Reference")
-      first-capitalized? name)))
+;; map filling
 
 (defn- add-type-declaration [acc type-name abstract base]
   (assoc acc type-name {:kind     :type
@@ -61,9 +25,7 @@
     (update-in acc [type-name :fields] conj field-info)
     acc)) ;; NOTE: there may be no existing type declaration on constrained types with constraints on inner fields of concrete types (see cholesterol.example.json -> valueQuantity). This library ignores such constraints
 
-(defn- path->type-name
-  [path]
-  (str/join (map capitalize-first path)))
+;; type processing
 
 (defn- embedded-type? [type-names]
   (#{["BackboneElement"] ["Element"]} type-names))
@@ -83,13 +45,7 @@
                      [(add-union-type acc type-name type-names) type-name])
     simple-type?   [acc (first type-names)]))
 
-(defn- path [major-type-name element]
-  (assoc
-   (-> (:path element)
-       (str/replace #"\[x\]$" "")
-       (str/split #"\."))
-   0
-   major-type-name))
+;; structure processing
 
 (defn- scalar? [path element]
   (and (:_code (first (:type element)))
@@ -104,7 +60,13 @@
 (defn- slice? [path element]
   (:sliceName element))
 
-(defn- process-element-rf [structure-def]
+(defn- enum? [enums]
+  (fn [path element]
+    (and (= ["Code"] (el/element-types element))
+         (when-let [url (el/value-set-url element)]
+           (contains? enums url)))))
+
+(defn- process-element-rf [structure-def enums]
   (let [major-type-name (->> (or (:name (first (:element (:snapshot structure-def))))
                                  (:name structure-def))
                              (re-seq #"\w+")
@@ -115,34 +77,46 @@
                                         (:baseDefinition structure-def))
                                     url->type-name))]
     (fn [acc element]
-      (let [path (path major-type-name element)]
+      (let [path (assoc (el/path element) 0 major-type-name)]
         (condp apply [path element]
-          type-decl? (add-type-declaration acc
-                                           (capitalize-first (first path))
-                                           (:abstract structure-def)
-                                           base-type-name)
-          slice?     acc
-          scalar?    (let [scalar-type-name (path->type-name (butlast path))]
-                       (reduced (if (graphql-scalar-types scalar-type-name)
-                                  {}
-                                  {scalar-type-name {:kind :scalar}})))
-          field?     (let [[acc type-name] (process-type-names
-                                            (mapv fhir->gql-type-name (:type element))
-                                            acc
-                                            path)]
-                       (add-field acc
-                                  (path->type-name (butlast path))
-                                  {:field       (last path)
-                                   :cardinality (cardinality element)
-                                   :type        type-name}))
+          type-decl?    (add-type-declaration acc
+                                              (capitalize-first (first path))
+                                              (:abstract structure-def)
+                                              base-type-name)
+          slice?        acc
+          scalar?       (let [scalar-type-name (path->type-name (butlast path))]
+                          (reduced (if (graphql-scalar-types scalar-type-name)
+                                     {}
+                                     {scalar-type-name {:kind :scalar}})))
+          (enum? enums) (add-field acc
+                                   (path->type-name (butlast path))
+                                   {:field       (last path)
+                                    :cardinality (el/cardinality element)
+                                    :type        (get enums (el/value-set-url element))})
+          field?        (let [[acc type-name] (process-type-names
+                                               (el/element-types element)
+                                               acc
+                                               path)]
+                          (add-field acc
+                                     (path->type-name (butlast path))
+                                     {:field       (last path)
+                                      :cardinality (el/cardinality element)
+                                      :type        type-name}))
           acc)))))
 
 ;; api
 
 ;; NOTE: GraphQL spec does not say if types can implement other concrete types in addition to interfaces, but existing implementations (graphql-java, for example) imply that types can implement only interfaces. This library may generate types that implement other concrete types (Age -> Quantity, for example).
-(defn structure-def->gql-type-map [json-str]
-  (let [structure-def (read-str json-str :key-fn keyword)]
-    (reduce (process-element-rf structure-def) {} (:element (:snapshot structure-def)))))
+(defn structure-def->gql-type-map
+  "enums is map, where keys are urls/uris of value sets referenced by element bindings"
+  ([json-str]
+   (structure-def->gql-type-map json-str nil))
+  ([json-str enums]
+   (let [structure-def (read-str json-str :key-fn keyword)]
+     (reduce (process-element-rf structure-def enums) {} (:element (:snapshot structure-def))))))
 
-(defn structure-def->schema-str [json-str]
-  (gql-type-map->schema-str (structure-def->gql-type-map json-str)))
+(defn structure-def->schema-str
+  ([json-str]
+   (structure-def->schema-str json-str nil))
+  ([json-str enums]
+   (gql-type-map->schema-str (structure-def->gql-type-map json-str enums))))
