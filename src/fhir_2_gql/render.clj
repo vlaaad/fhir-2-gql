@@ -1,6 +1,5 @@
 (ns fhir-2-gql.render
-  (:require [clojure.string :as str]
-            ))
+  (:require [clojure.string :as str]))
 (defn- render-cardinality
   [cardinality type]
   (case cardinality

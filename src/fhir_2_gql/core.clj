@@ -23,23 +23,23 @@
 (defn- fhir->gql-type-name [type-info]
   (let [name (:code type-info)]
     (condp call name
-      #{"boolean"}       "Boolean"
       #{"id"}            "ID"
-      #{"decimal"}       "Float"
       #{"integer"
         "positiveInt"
         "unsignedInt"}   "Int"
-      #{"oid"}           "Uri"
       #{"time"
+        "oid"
+        "boolean"
+        "decimal" ;; NOTE decimal is mapped to custom scalar type instead of Float because FHIR spec recommends using bigints instead of floats
         "date"
         "dateTime"
         "instant"
         "string"
         "uri"
-        "base64Binary"}  (capitalize-first name)
-      #{"code"
         "markdown"
-        "xhtml"}         "String"
+        "code"
+        "base64Binary"}  (capitalize-first name)
+      #{"xhtml"}         "String"
       #{"Reference"}     (if-let [referenced-url (first (or (:profile type-info)
                                                             (:targetProfile type-info)))]
                            (url->type-name referenced-url)
@@ -54,13 +54,12 @@
 
 (defn- add-union-type [acc type-name types]
   (assoc acc type-name {:kind :union
-                        :types types}))
+                        :types (set types)}))
 
 (defn- add-field [acc type-name field-info]
-  (when-not (get acc type-name)
-    (throw (ex-info "can't add field to non-existent type" {:type  type-name
-                                                            :field field-info})))
-  (update-in acc [type-name :fields] conj field-info))
+  (if (contains? acc type-name)
+    (update-in acc [type-name :fields] conj field-info)
+    acc)) ;; NOTE: there may be no existing type declaration on constrained types with constraints on inner fields of concrete types (see cholesterol.example.json -> valueQuantity). This library ignores such constraints
 
 (defn- path->type-name
   [path]
@@ -70,7 +69,7 @@
   (#{["BackboneElement"] ["Element"]} type-names))
 
 (defn union-type? [type-names]
-  ;; NOTE: covers 2 cases: references to multiple and "[x]"-values
+  ;; NOTE: covers 2 cases: references to values of either values and embedded "[x]"-values
   (> (count type-names) 1))
 
 (defn simple-type? [type-names]
@@ -78,58 +77,69 @@
 
 (defn- process-type-names [type-names acc path]
   (condp call type-names
-    embedded-type?        (let [type-name (path->type-name path)]
-                            [(add-type-declaration acc type-name false nil) type-name])
-    union-type? (let [type-name (path->type-name path)]
-                            [(add-union-type acc type-name type-names) type-name])
-    simple-type?          [acc (first type-names)]))
+    embedded-type? (let [type-name (path->type-name path)]
+                     [(add-type-declaration acc type-name false nil) type-name])
+    union-type?    (let [type-name (path->type-name path)]
+                     [(add-union-type acc type-name type-names) type-name])
+    simple-type?   [acc (first type-names)]))
 
-(defn- path [element]
-  (-> (:path element)
-      (str/replace #"\[x\]$" "")
-      (str/split #"\.")))
+(defn- path [major-type-name element]
+  (assoc
+   (-> (:path element)
+       (str/replace #"\[x\]$" "")
+       (str/split #"\."))
+   0
+   major-type-name))
 
-(defn- scalar? [element]
+(defn- scalar? [path element]
   (and (:_code (first (:type element)))
-       (= "value" (last (path element)))))
+       (= "value" (last path))))
 
-(defn- field? [element]
+(defn- field? [path element]
   (:type element))
 
-(defn- type-decl? [element]
-  (= 1 (count (path element))))
+(defn- type-decl? [path element]
+  (= 1 (count path)))
 
-(defn- slice? [element]
+(defn- slice? [path element]
   (:sliceName element))
 
 (defn- process-element-rf [structure-def]
-  (fn [acc element]
-    (let [path (path element)]
-      (condp call element
-        type-decl? (add-type-declaration acc
-                                         (capitalize-first (first path))
-                                         (:abstract structure-def)
-                                         (some-> (or (:base structure-def)
-                                                     (:baseDefinition structure-def))
-                                                 url->type-name))
-        slice?     acc
-        scalar?    (let [scalar-type-name (path->type-name (butlast path))]
-                     (reduced (if (graphql-scalar-types scalar-type-name)
-                                {}
-                                {scalar-type-name {:kind :scalar}})))
-        field?     (let [[acc type-name] (process-type-names
-                                          (mapv fhir->gql-type-name (:type element))
-                                          acc
-                                          path)]
-                     (add-field acc
-                                     (path->type-name (butlast path))
-                                     {:field       (last path)
-                                      :cardinality (cardinality element)
-                                      :type        type-name}))
-        acc))))
+  (let [major-type-name (->> (or (:name (first (:element (:snapshot structure-def))))
+                                 (:name structure-def))
+                             (re-seq #"\w+")
+                             (map capitalize-first)
+                             str/join)
+        base-type-name  (or (:constrainedType structure-def)
+                            (some-> (or (:base structure-def)
+                                        (:baseDefinition structure-def))
+                                    url->type-name))]
+    (fn [acc element]
+      (let [path (path major-type-name element)]
+        (condp apply [path element]
+          type-decl? (add-type-declaration acc
+                                           (capitalize-first (first path))
+                                           (:abstract structure-def)
+                                           base-type-name)
+          slice?     acc
+          scalar?    (let [scalar-type-name (path->type-name (butlast path))]
+                       (reduced (if (graphql-scalar-types scalar-type-name)
+                                  {}
+                                  {scalar-type-name {:kind :scalar}})))
+          field?     (let [[acc type-name] (process-type-names
+                                            (mapv fhir->gql-type-name (:type element))
+                                            acc
+                                            path)]
+                       (add-field acc
+                                  (path->type-name (butlast path))
+                                  {:field       (last path)
+                                   :cardinality (cardinality element)
+                                   :type        type-name}))
+          acc)))))
 
 ;; api
 
+;; NOTE: GraphQL spec does not say if types can implement other concrete types in addition to interfaces, but existing implementations (graphql-java, for example) imply that types can implement only interfaces. This library may generate types that implement other concrete types (Age -> Quantity, for example).
 (defn structure-def->gql-type-map [json-str]
   (let [structure-def (read-str json-str :key-fn keyword)]
     (reduce (process-element-rf structure-def) {} (:element (:snapshot structure-def)))))
